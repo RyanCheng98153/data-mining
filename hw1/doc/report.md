@@ -1,4 +1,5 @@
 # 作業報告: 使用 Linear Regression 預測 PM2.5
+Student ID: 314554025
 
 ## 1. Feature Selection & Pre-processing
 > How do you select features for your model input, and what preprocessing did you perform?
@@ -6,9 +7,9 @@
 ### 1.1 Feature Selection
 
 為了預測第10小時的 PM2.5，我將 data 中全部 18 個屬性作為 Linear Regression Model 的 Feature，包括: 
-- `AMB_TEMP, CH4, CO, NMHC, NO, NO2, NOx, O3, PM10, PM2.5, RAINFALL, RH, SO2, THC, WD_HR, WIND_DIREC, WIND_SPEED, WS_HR`。
-
-* 我實作的 model 也支援特定 feature ，例如只使用 `CH4` 和 `CO` 來分析其對模型準確度的影響。但再經過 ablation study 過後，我發現去掉個別 feature 對模型影響不大，最後還是使用所有 feature 進行訓練，且為表現最好的 model
+- `AMB_TEMP, CH4, CO, NMHC, NO, NO2, NOx, O3, PM10, PM2.5, RAINFALL, RH, SO2, THC, WD_HR, WIND_DIREC, WIND_SPEED, WS_HR`
+- 我實作的 model 也支援特定 feature ，例如只使用 `CH4` 和 `CO` 來分析其對模型準確度的影響。
+- 但再經過 ablation study 過後，我發現去掉個別 feature 對模型影響不大，最後還是使用所有 feature 進行訓練。
 
     ![ablation_result](./figs/ablation_results.png)
 
@@ -16,9 +17,8 @@
 ### 1.2 Data Cleaning
 
 * 由於無論 train 或是 test 的 value 欄位資料，皆有包含非數值資料（如 `"x"`, `"#"` 等）
+* 其中 SO2 的資料缺少嚴重，甚至有整 row 資料缺失的情況，其他 Feature (如: NOx) 也有部分缺少資料的情況
 * 因此我先將這些不合法資料，轉換為 `NaN`，確保模型僅使用有效數值。
-* 其中 SO2 的資料缺少嚴重，甚至有整 row 資料缺失的情況
-* 其次是 NOx、和其他 Feature 也有部分缺少資料的情況
 
 ### 1.3 Data Imputation
 
@@ -42,8 +42,7 @@ Note: 我試過使用 Linear Interpolation (線性內插) 的方式進行 `NaN` 
   - => 這連續的 480 小時中的資料，都能透過 sliding window 進行取任意連續 9 小時資料，預測第 10 小時資料
 
 - test.csv
-  - 測試資料 (`test.csv`) 中的每個 index 為獨立的 9 小時序列，不跨天。
-  - 因此 test.csv 的資料須彼此視為獨立樣本。
+  - 測試資料 (`test.csv`) 中的每個 index 為獨立的 9 小時序列，不跨天，因此須彼此視為獨立樣本。
 
 ---
 
@@ -52,15 +51,10 @@ Note: 我試過使用 Linear Interpolation (線性內插) 的方式進行 `NaN` 
 
 ### 2-1 方法
 * 以月份為單位拆分資料作為驗證集，保持時間連續性。
-* 嘗試不同訓練資料量：前 8 個月、9 個月、10 個月、11個月。
-* 剩餘作為 valid set 
-* 使用 **RMSE** 作為驗證指標。
+* 嘗試不同訓練資料量：前 8 個月、9 個月、10 個月、11個月 作為 train set，剩餘作為 valid set 
 
-### 2-2 結果
-
-- train set / valid set 的 月份比較，ex: 8:4 = train set 取前 8 個月資料，valid set 取後 4 個月資料
-- 不同 train set 和 valid set 的 RMSE 比較
-  - epochs = 10000, default setting
+### 2-2 不同 train set 和 valid set 的 RMSE 比較
+- epochs = 10000, default setting
 
 | train / valid | Train RMSE | Validation RMSE | Epochs |
 | ------------- | ---------- | --------------- | ------ |
@@ -139,7 +133,7 @@ Note:
   * 使用所有特徵與12個月訓練資料效果最佳。
   * 實作 Early stopping 可避免過度訓練，減少 overfitting。
 
-### 程式執行方式: (可直接見 README.md)
+### 程式執行方式: (可直接見 [README.md](./README.md))
 - 表現最好的參數
 ```sh
 python train_model.py --train ./train.csv --test ./test.csv \
