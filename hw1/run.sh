@@ -143,7 +143,7 @@ echo -e "\n[From Echo] =============================== Separator ===============
 
 # ========== New experiments ==========
 
-echo -e "\n[From Echo] Testing... : epochs = 20000, val_months = 1, patience = 100000, standardize, no validation set"
-python train_model.py --train ./data/train.csv --test ./data/test.csv \
-    --out_model model_epochs_20000_val_1_pat_100000_standardized_noval.npz --out_pred predictions_epochs_20000_val_1_pat_100000_standardized_noval.csv \
-    --epochs 20000 --val_months 1 --patience 100000 --standardize
+# echo -e "\n[From Echo] Testing... : epochs = 20000, val_months = 1, patience = 100000, standardize, no validation set"
+# python train_model.py --train ./data/train.csv --test ./data/test.csv \
+#     --out_model model_epochs_20000_val_1_pat_100000_standardized_noval.npz --out_pred predictions_epochs_20000_val_1_pat_100000_standardized_noval.csv \
+#     --epochs 20000 --val_months 1 --patience 100000 --standardize
