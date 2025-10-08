@@ -147,6 +147,9 @@ def train_linear_gd(X_train, y_train, X_val, y_val, cfg, init_w=None):
     best_w = w.copy()
     wait = 0
     history = {'train_rmse': [], 'val_rmse': []}
+    
+    no_val = (len(y_val) == 0)  # ← 檢查是否有驗證集
+    
     for epoch in range(1, cfg['epochs']+1):
         preds = X_train.dot(w)
         err = preds - y_train
@@ -154,22 +157,41 @@ def train_linear_gd(X_train, y_train, X_val, y_val, cfg, init_w=None):
         reg_grad = np.hstack([0.0, 2.0 * cfg['lambda_l2'] * w[1:]])  # no reg on bias
         grad += reg_grad
         w -= lr * grad
+        
+        # 計算 train_rmse
         train_rmse = math.sqrt(np.mean((X_train.dot(w) - y_train)**2))
-        val_rmse = math.sqrt(np.mean((X_val.dot(w) - y_val)**2))
         history['train_rmse'].append(train_rmse)
-        history['val_rmse'].append(val_rmse)
-        improved = (best_val_rmse - val_rmse) > cfg['min_delta']
-        if improved:
-            best_val_rmse = val_rmse
-            best_w = w.copy()
-            wait = 0
+        
+        # 若沒有 validation，就跳過這步
+        if no_val:
+            val_rmse = float('nan')
+            improved = False
+            best_w = w.copy()  # 直接更新，不早停
+            wait = 0  # 沒有 val 時不啟用 early stopping
         else:
-            wait += 1
+            # 計算 val_rmse
+            val_rmse = math.sqrt(np.mean((X_val.dot(w) - y_val)**2))
+            history['val_rmse'].append(val_rmse)
+            improved = (best_val_rmse - val_rmse) > cfg['min_delta']
+            if improved:
+                best_val_rmse = val_rmse
+                best_w = w.copy()
+                wait = 0
+            else:
+                wait += 1
+        
+        # 印出訓練進度
         if epoch % max(1, cfg['epochs']//20) == 0 or epoch==1:
-            print(f"Epoch {epoch:4d} train_rmse={train_rmse:.4f} val_rmse={val_rmse:.4f} best_val={best_val_rmse:.4f} wait={wait}")
-        if wait >= cfg['patience']:
+            if no_val:
+                print(f"Epoch {epoch:4d} train_rmse={train_rmse:.4f}")
+            else:
+                print(f"Epoch {epoch:4d} train_rmse={train_rmse:.4f} val_rmse={val_rmse:.4f} best_val={best_val_rmse:.4f} wait={wait}")
+        
+        # Early stopping 僅在有 val set 時生效
+        if not no_val and wait >= cfg['patience']:
             print("Early stopping at epoch", epoch)
             break
+    
     return best_w, history, epoch
 
 # ------------------ main pipeline ------------------
@@ -211,12 +233,20 @@ def main(args):
     # split by month
     if args.val_months >= len(months):
         raise ValueError("val_months too large")
-    train_months = months[:-args.val_months]
-    val_months = months[-args.val_months:]
-    meta_months = np.array([m for (m,t) in meta])
-    train_mask = np.isin(meta_months, train_months)
-    val_mask = np.isin(meta_months, val_months)
-    
+    if args.val_months == 0:
+        # 用全部月份訓練，不分 validation
+        train_months = months
+        val_months = []
+        meta_months = np.array([m for (m,t) in meta])
+        train_mask = np.ones(len(meta_months), dtype=bool)
+        val_mask = np.zeros(len(meta_months), dtype=bool)
+    else:
+        train_months = months[:-args.val_months]
+        val_months = months[-args.val_months:]
+        meta_months = np.array([m for (m,t) in meta])
+        train_mask = np.isin(meta_months, train_months)
+        val_mask = np.isin(meta_months, val_months)
+        
     X_train = X[train_mask]; y_train = y[train_mask]
     X_val   = X[val_mask];   y_val = y[val_mask]
     print("Train samples:", X_train.shape[0], "Val samples:", X_val.shape[0])
