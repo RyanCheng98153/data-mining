@@ -7,7 +7,6 @@
 
 ### Using [uv](https://github.com/astral-sh/uv) (recommended)
 ```bash
-uv init
 uv sync
 ```
 Activate the virtual environment:
