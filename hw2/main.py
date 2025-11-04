@@ -166,32 +166,46 @@ def evaluate_and_submit(model, train_loader, test_loader, criterion_eval, config
             loss_per_sample = loss_per_sample.view(loss_per_sample.size(0), -1).mean(dim=1)
             
             # 將分數與閾值比較，產生 0 (normal) 或 1 (anomaly)
-            preds = (loss_per_sample > threshold).cpu().numpy().astype(int)
+            # preds = (loss_per_sample > threshold).cpu().numpy().astype(int)
+            preds = loss_per_sample.cpu().numpy()
             
             # 儲存結果
             for fname, pred_label in zip(filenames, preds):
                 # 儲存 0 或 1
                 results.append({'filename': fname, 'prediction': pred_label})
 
-    print("Evaluation finished.")
+    # threshold 使用 results 中的中位數作為最終閾值
+    all_scores = np.array([r['prediction'] for r in results])
+    final_threshold = np.median(all_scores)
+    print(f"Final threshold (median of scores): {final_threshold:.6f}")
+    
+    submission_results = []
+    
+    for k, r in enumerate(results):
+        submission_results.append({'filename': r['filename'], 
+                                   'prediction': 1 if r['prediction'] > final_threshold else 0})
     
     # --- 3. 產生 Kaggle 提交檔案 ---
     submission_filename = config['SUBMISSION_FILE']
     print(f"Generating submission file: {submission_filename}")
-    
-    df = pd.DataFrame(results)
-    
-    # 從 '0.png', '1.png' 中提取 'id'
-    df['id'] = df['filename'].apply(lambda x: int(os.path.splitext(x)[0]))
-    
-    # 確保 ID 排序正確並只保留 'id' 和 'prediction' 欄位
-    df = df.sort_values(by='id')
-    df_submission = df[['id', 'prediction']]
-    
-    # 儲存為 CSV
-    df_submission.to_csv(submission_filename, index=False)
-    print("Submission file created successfully!")
-    print(df_submission.head())
+
+    def gen_csv(results, output_filename):
+        df = pd.DataFrame(results)
+        
+        # 從 '0.png', '1.png' 中提取 'id'
+        df['id'] = df['filename'].apply(lambda x: int(os.path.splitext(x)[0]))
+        
+        # 確保 ID 排序正確並只保留 'id' 和 'prediction' 欄位
+        df = df.sort_values(by='id')
+        df_submission = df[['id', 'prediction']]
+        
+        # 儲存為 CSV
+        df_submission.to_csv(output_filename, index=False)
+        print("Submission file created successfully!")
+        print(df_submission.head())
+
+    gen_csv(submission_results, submission_filename)
+    gen_csv(results, submission_filename.replace('.csv', '_analysis.csv'))
 
 def unique_filename(filename):
     # if file is exists, append a number to make it unique
@@ -236,7 +250,7 @@ if __name__ == "__main__":
     config = {
         'DEVICE': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         'DATA_PATH': './dataset/',
-        'SUBMISSION_FILE': 'submission.csv',
+        'SUBMISSION_FILE': unique_filename('submission.csv'),
         # 'MODEL_SAVE_PATH' 用於 *儲存* 新訓練的模型
         'MODEL_SAVE_PATH': unique_filename('./anomaly_ae.pth'), 
         'TRAIN_MODE': TRAIN_MODE,
@@ -255,8 +269,8 @@ if __name__ == "__main__":
     }
     
     # 從 config 衍生路徑
-    config['TRAIN_DIR'] = os.path.join(config['DATA_PATH'], 'test')
-    config['TEST_DIR'] = os.path.join(config['DATA_PATH'], 'train')
+    config['TRAIN_DIR'] = os.path.join(config['DATA_PATH'], 'train')
+    config['TEST_DIR'] = os.path.join(config['DATA_PATH'], 'test')
 
     print(f"Using device: {config['DEVICE']}")
     
