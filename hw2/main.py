@@ -9,6 +9,7 @@ import glob
 import pandas as pd
 import numpy as np
 from tqdm import tqdm # 用於顯示進度條
+import argparse  # <-- 1. 加入 import
 
 # --- 3. Custom MVTec Dataset ---
 class MVTecDataset(Dataset):
@@ -192,17 +193,53 @@ def evaluate_and_submit(model, train_loader, test_loader, criterion_eval, config
     print("Submission file created successfully!")
     print(df_submission.head())
 
+def unique_filename(filename):
+    # if file is exists, append a number to make it unique
+    base, ext = os.path.splitext(filename)
+    counter = 1
+    new_filename = filename
+    while os.path.exists(new_filename):
+        new_filename = f"{base}_{counter}{ext}"
+        counter += 1
+    return new_filename
+
+# --- 2. Argument Parser ---
+def argument_parser():
+    parser = argparse.ArgumentParser(description="Anomaly Detection with Autoencoder")
+    
+    # --eval 參數: store_true 表示如果有此參數則為 True (預設 False)
+    # 如果執行 'python script.py --eval'，則 args.eval 會是 True
+    parser.add_argument('--eval', action='store_true', default=False, 
+                        help='Set this flag to evaluation mode (skip training)')
+
+    # --load_model 參數: 指定模型路徑
+    parser.add_argument('--load_model', type=str, default=None, 
+                        help='Path to load a pre-trained model for evaluation')
+        
+    return parser.parse_args()
+
 
 # --- 7. Main Execution ---
 if __name__ == "__main__":
+    
+    # --- 0. Parse Arguments ---
+    args = argument_parser()
+    
+    # 根據 --eval 參數設定 TRAIN_MODE
+    # 如果有 --eval, args.eval 為 True, TRAIN_MODE 為 False
+    TRAIN_MODE = not args.eval
+    
+    # 取得要載入的模型路徑
+    model_load_path = args.load_model
     
     # --- 1. Configuration & Hyperparameters ---
     config = {
         'DEVICE': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         'DATA_PATH': './dataset/',
         'SUBMISSION_FILE': 'submission.csv',
-        'MODEL_SAVE_PATH': './anomaly_ae.pth', # 儲存/載入模型的路徑
-        'TRAIN_MODE': True,                   # True: 訓練模型 | False: 載入模型
+        # 'MODEL_SAVE_PATH' 用於 *儲存* 新訓練的模型
+        'MODEL_SAVE_PATH': unique_filename('./anomaly_ae.pth'), 
+        'TRAIN_MODE': TRAIN_MODE,
         
         # 模型超參數
         'IMG_SIZE': 128,
@@ -218,8 +255,8 @@ if __name__ == "__main__":
     }
     
     # 從 config 衍生路徑
-    config['TRAIN_DIR'] = os.path.join(config['DATA_PATH'], 'train')
-    config['TEST_DIR'] = os.path.join(config['DATA_PATH'], 'test')
+    config['TRAIN_DIR'] = os.path.join(config['DATA_PATH'], 'test')
+    config['TEST_DIR'] = os.path.join(config['DATA_PATH'], 'train')
 
     print(f"Using device: {config['DEVICE']}")
     
@@ -245,7 +282,8 @@ if __name__ == "__main__":
     train_loader = DataLoader(
         train_dataset, 
         batch_size=config['BATCH_SIZE'], 
-        shuffle=True if config['TRAIN_MODE'] else False, # 訓練時 shuffle, 評估時不用
+        # 訓練時 shuffle, 評估/計算閾值時不用
+        shuffle=True if config['TRAIN_MODE'] else False, 
         num_workers=config['NUM_WORKERS'], 
         pin_memory=config['PIN_MEMORY']
     )
@@ -274,23 +312,31 @@ if __name__ == "__main__":
     if config['TRAIN_MODE']:
         print("Mode: Training")
         optimizer = optim.Adam(model.parameters(), lr=config['LR'], weight_decay=1e-5)
-        # 傳入 config 字典
+        # T傳入 config 字典
         train_model(model, train_loader, criterion_train, optimizer, config)
         
         # 訓練後儲存模型
         print(f"Saving model to {config['MODEL_SAVE_PATH']}...")
         torch.save(model.state_dict(), config['MODEL_SAVE_PATH'])
-        print("Model saved.")
+        print(f"Model saved to {config['MODEL_SAVE_PATH']}")
     
-    else:
-        print(f"Mode: Loading model from {config['MODEL_SAVE_PATH']}")
-        if not os.path.exists(config['MODEL_SAVE_PATH']):
-            print(f"Error: Model file not found at {config['MODEL_SAVE_PATH']}")
-            print("Please set TRAIN_MODE = True to train and save a model first.")
-            exit()
+    else: # 進入評估模式 (TRAIN_MODE = False)
+        print(f"Mode: Evaluation")
         
+        # 檢查是否提供了 --load_model 參數
+        if model_load_path is None:
+            print("Error: Evaluation mode selected (--eval) but no model path provided.")
+            print("Please use --load_model <path_to_model.pth> to specify the model to load.")
+            exit()
+            
+        # 檢查模型檔案是否存在
+        if not os.path.exists(model_load_path):
+            print(f"Error: Model file not found at {model_load_path}")
+            exit()
+            
         # 載入已儲存的權重
-        model.load_state_dict(torch.load(config['MODEL_SAVE_PATH']))
+        print(f"Loading model from {model_load_path}...")
+        model.load_state_dict(torch.load(model_load_path, map_location=config['DEVICE']))
         print("Model loaded successfully.")
 
     
