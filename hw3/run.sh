@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Run training for the model
-python main.py --mode train 
-    --train_data ./dataset/train 
+python main.py --mode train \
+    --train_data ./dataset/train \
     --save_dir ./save_models
 
 # Run inference for the model
