@@ -422,9 +422,18 @@ def inference(args):
     
     cols = ['id'] + [f'p{i+1}' for i in range(15)]
     sub_df = pd.DataFrame(results, columns=cols)
-    out_file = 'submission.csv'
+    out_file = unique_filename('submission.csv')
     sub_df.to_csv(out_file, index=False)
     log(f"Submission saved to {out_file} (Rows: {len(sub_df)})")
+
+def unique_filename(base_name):
+    """生成唯一的檔案名稱以避免覆蓋"""
+    counter = 1
+    new_name = base_name
+    while os.path.exists(new_name):
+        new_name = f"{os.path.splitext(base_name)[0]}_{counter}{os.path.splitext(base_name)[1]}"
+        counter += 1
+    return new_name
 
 # ==========================================
 # 4. 主程式入口 (Main Entry)
