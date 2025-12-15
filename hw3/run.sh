@@ -4,9 +4,9 @@
 python main.py --mode train \
     --train_data ./dataset/train \
     --save_dir ./save_models \
-    --epochs 1000 \
+    --epochs 200 \
 
-for i in {1..1000}
+for i in {1..200}
 do
     echo "----------------------------------------"
     echo "Running inference iteration $i"
