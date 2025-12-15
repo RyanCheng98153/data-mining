@@ -3,7 +3,7 @@
 # Run training for the model
 python main.py --mode train \
     --train_data ./dataset/train \
-    --save_dir ./save_models
+    --save_dir ./save_models \
     --epochs 1000 \
 
 for i in {1..1000}
