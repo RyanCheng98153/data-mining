@@ -24,7 +24,7 @@ MAX_HISTORY_LEN = 50
 # 總 Batch Size = 512 * 8 = 4096
 BATCH_SIZE = 512  
 
-NUM_EPOCHS = 5
+NUM_EPOCHS = 30
 # [優化] 因為總 Batch Size 變大，Learning Rate 建議稍微調大
 LEARNING_RATE = 0.001  
 NUM_NEGATIVES = 4
