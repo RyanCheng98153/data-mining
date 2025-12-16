@@ -1,463 +1,446 @@
-import os
-import argparse
 import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from tqdm import tqdm
-import json
-import pickle
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+from collections import Counter
+import re
+import os
+import random
 import sys
-import datetime
-import time
+from tqdm import tqdm
 
-# ==========================================
-# 工具函數 (Utils)
-# ==========================================
+# --- 1. 設定參數 (針對 8x V100 優化) ---
+MAX_TITLE_LEN = 30
+MAX_HISTORY_LEN = 50
 
-def log(msg):
-    """格式化輸出日誌，帶上時間戳"""
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {msg}")
+# [優化] 單卡 Batch Size 加大，V100 32GB 絕對吃得下 512 甚至 1024
+# 總 Batch Size = 512 * 8 = 4096
+BATCH_SIZE = 512  
 
-def set_seed(seed=42):
-    log(f"Setting random seed to {seed}...")
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+NUM_EPOCHS = 20
+# [優化] 因為總 Batch Size 變大，Learning Rate 建議稍微調大
+LEARNING_RATE = 0.001  
+NUM_NEGATIVES = 4
 
-def get_model_params(model):
-    """計算模型參數量"""
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+# Embedding 設定
+WORD_EMB_DIM = 100
+CAT_EMB_DIM = 50
+NEWS_HEADS = 20
+NEWS_DIM = 250
+TOTAL_NEWS_DIM = NEWS_DIM + CAT_EMB_DIM
+USER_HEADS = 20
 
-# ==========================================
-# 1. 資料處理與載入 (Data Processing)
-# ==========================================
+# 路徑設定
+PATH_TRAIN_NEWS = 'dataset/train/train_news.tsv'
+PATH_TRAIN_BEHAVIORS = 'dataset/train/train_behaviors.tsv'
+PATH_GLOVE = 'dataset/glove_6B_100d.txt'
+PATH_TEST_NEWS = 'dataset/test/test_news.tsv'
+PATH_TEST_BEHAVIORS = 'dataset/test/test_behaviors.tsv'
 
-class NewsProcessor:
-    def __init__(self, max_title_len=30):
-        self.word2idx = {"<PAD>": 0, "<UNK>": 1}
-        self.category2idx = {"<PAD>": 0}
-        self.entity2idx = {"<PAD>": 0}
-        self.max_title_len = max_title_len
-        self.news_features = {} # NewsID -> Features
-        self.entity_vectors = [] 
-    
-    def load_entity_embeddings(self, vec_path):
-        log(f"Loading entity embeddings from {vec_path}...")
-        start_time = time.time()
-        entity_vectors = [np.zeros(100)] # padding vector (index 0)
-        self.entity2idx = {"<PAD>": 0}
+# --- 2. DDP 工具函數 ---
+
+def setup_ddp():
+    # torchrun 會自動設定環境變數
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
         
-        if not os.path.exists(vec_path):
-            log(f"Warning: Entity file {vec_path} not found. Using random initialization.")
-            self.entity_vectors = np.random.rand(1, 100)
-            return
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+        return local_rank, rank, world_size
+    else:
+        # 單機 fallback
+        print("Not running in DDP mode. Using standard single GPU.")
+        return 0, 0, 1
 
-        with open(vec_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                parts = line.strip().split('\t')
-                entity_id = parts[0]
-                vector = np.array([float(x) for x in parts[1:]], dtype=np.float32)
-                
-                self.entity2idx[entity_id] = len(self.entity2idx)
-                entity_vectors.append(vector)
+def cleanup_ddp():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def is_main_process():
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+# --- 3. 模型定義 (保持不變，但在 Main 中會被 DDP 包裝) ---
+
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        assert self.head_dim * num_heads == d_model, "d_model must be divisible by num_heads"
+        self.query = nn.Linear(d_model, d_model)
+        self.key = nn.Linear(d_model, d_model)
+        self.value = nn.Linear(d_model, d_model)
+        self.fc_out = nn.Linear(d_model, d_model)
         
-        self.entity_vectors = np.array(entity_vectors)
-        elapsed = time.time() - start_time
-        log(f"Loaded {len(self.entity_vectors)} entities (Shape: {self.entity_vectors.shape}) in {elapsed:.2f}s.")
+    def forward(self, x):
+        N, seq_length, _ = x.shape
+        Q = self.query(x).view(N, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        K = self.key(x).view(N, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        V = self.value(x).view(N, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        energy = torch.matmul(Q, K.permute(0, 1, 3, 2)) / (self.d_model ** 0.5)
+        attention = torch.softmax(energy, dim=-1)
+        out = torch.matmul(attention, V).permute(0, 2, 1, 3).contiguous().view(N, seq_length, self.d_model)
+        return self.fc_out(out)
 
-    def build_vocab(self, news_path):
-        log(f"Building vocabulary from {news_path}...")
-        df = pd.read_csv(news_path, sep='\t', header=None, 
-                         names=['news_id', 'category', 'subcategory', 'title', 'abstract', 'url', 'title_entities', 'abstract_entities'])
+class AdditiveAttention(nn.Module):
+    def __init__(self, input_dim, query_dim=200):
+        super().__init__()
+        self.linear = nn.Linear(input_dim, query_dim)
+        self.query = nn.Parameter(torch.randn(query_dim, 1))
         
-        for title in df['title'].fillna(""):
-            words = title.lower().split()
-            for w in words:
-                if w not in self.word2idx:
-                    self.word2idx[w] = len(self.word2idx)
-        
-        for cat in df['category'].unique():
-            if cat not in self.category2idx:
-                self.category2idx[cat] = len(self.category2idx)
-                
-        log(f"Vocabulary built. Words: {len(self.word2idx)}, Categories: {len(self.category2idx)}")
-
-    def process_news(self, news_path, is_train=True):
-        mode_str = "Train" if is_train else "Test"
-        log(f"Processing {mode_str} news from {news_path}...")
-        
-        df = pd.read_csv(news_path, sep='\t', header=None, 
-                         names=['news_id', 'category', 'subcategory', 'title', 'abstract', 'url', 'title_entities', 'abstract_entities'])
-        
-        success_count = 0
-        for _, row in tqdm(df.iterrows(), total=len(df), desc=f"Parsing {mode_str} News"):
-            news_id = row['news_id']
-            
-            # Title Processing
-            title_words = row['title'].lower().split() if isinstance(row['title'], str) else []
-            title_indices = [self.word2idx.get(w, self.word2idx["<UNK>"]) for w in title_words][:self.max_title_len]
-            title_indices += [0] * (self.max_title_len - len(title_indices))
-            
-            # Category
-            cat_idx = self.category2idx.get(row['category'], 0)
-            
-            # Entity Processing
-            entity_idx = 0
-            if isinstance(row['title_entities'], str):
-                try:
-                    ents = json.loads(row['title_entities'])
-                    if ents:
-                        wiki_id = ents[0].get('WikidataId')
-                        entity_idx = self.entity2idx.get(wiki_id, 0)
-                except:
-                    pass
-            
-            self.news_features[news_id] = {
-                'title': torch.tensor(title_indices, dtype=torch.long),
-                'category': torch.tensor(cat_idx, dtype=torch.long),
-                'entity': torch.tensor(entity_idx, dtype=torch.long)
-            }
-            success_count += 1
-            
-        log(f"Successfully processed {success_count} news items.")
-
-    def save(self, path):
-        log(f"Saving processor state to {path}...")
-        with open(path, 'wb') as f:
-            pickle.dump({
-                'word2idx': self.word2idx,
-                'category2idx': self.category2idx,
-                'entity2idx': self.entity2idx,
-                'entity_vectors': self.entity_vectors
-            }, f)
-
-    def load(self, path):
-        log(f"Loading processor state from {path}...")
-        with open(path, 'rb') as f:
-            data = pickle.load(f)
-            self.word2idx = data['word2idx']
-            self.category2idx = data['category2idx']
-            self.entity2idx = data['entity2idx']
-            self.entity_vectors = data['entity_vectors']
-        log("Processor state loaded.")
-
-class BehaviorDataset(Dataset):
-    def __init__(self, behaviors_path, news_processor, max_history=50, is_test=False):
-        self.news_processor = news_processor
-        self.max_history = max_history
-        self.is_test = is_test
-        self.samples = []
-        
-        log(f"Loading behaviors from {behaviors_path}...")
-        df = pd.read_csv(behaviors_path, sep='\t')
-        
-        # 統計資訊
-        missing_news_count = 0
-        empty_history_count = 0
-        
-        for _, row in tqdm(df.iterrows(), total=len(df), desc="Parsing Behaviors"):
-            imp_id = row['id']
-            history = str(row['clicked_news']).split() if isinstance(row['clicked_news'], str) else []
-            impressions = str(row['impressions']).split() if isinstance(row['impressions'], str) else []
-            
-            # Process History
-            hist_indices = []
-            for nid in history:
-                if nid in self.news_processor.news_features:
-                    hist_indices.append(self.news_processor.news_features[nid])
-                else:
-                    missing_news_count += 1
-            
-            hist_indices = hist_indices[:self.max_history]
-            
-            if not hist_indices:
-                empty_history_count += 1
-                dummy = {'title': torch.zeros(30, dtype=torch.long), 'category': torch.tensor(0), 'entity': torch.tensor(0)}
-                hist_indices = [dummy]
-            
-            if self.is_test:
-                candidate_news_ids = [imp.split('-')[0] for imp in impressions]
-                self.samples.append({
-                    'imp_id': imp_id,
-                    'history': hist_indices,
-                    'candidates': candidate_news_ids
-                })
-            else:
-                candidate_features = []
-                labels = []
-                for imp in impressions:
-                    parts = imp.split('-')
-                    nid = parts[0]
-                    label = int(parts[1])
-                    if nid in self.news_processor.news_features:
-                        candidate_features.append(self.news_processor.news_features[nid])
-                        labels.append(label)
-                
-                if candidate_features:
-                    self.samples.append({
-                        'imp_id': imp_id,
-                        'history': hist_indices,
-                        'candidates': candidate_features,
-                        'labels': labels
-                    })
-        
-        log(f"Dataset created. Samples: {len(self.samples)}")
-        log(f"Stats: Empty History Users: {empty_history_count}, Missing History News: {missing_news_count}")
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        return self.samples[idx]
-
-def collate_fn(batch):
-    return batch
-
-# ==========================================
-# 2. 模型架構 (Model Architecture)
-# ==========================================
+    def forward(self, x):
+        attn_scores = torch.matmul(torch.tanh(self.linear(x)), self.query)
+        attn_weights = F.softmax(attn_scores, dim=1)
+        output = torch.bmm(attn_weights.permute(0, 2, 1), x).squeeze(1)
+        return output
 
 class NewsEncoder(nn.Module):
-    def __init__(self, vocab_size, embed_dim, entity_vectors, category_size):
+    def __init__(self, vocab_size, cat_size, pretrained_emb=None):
         super().__init__()
-        self.word_embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        
-        if len(entity_vectors) > 0:
-            self.entity_embedding = nn.Embedding.from_pretrained(torch.tensor(entity_vectors).float(), freeze=False)
-            self.entity_dim = entity_vectors.shape[1]
-        else:
-            self.entity_embedding = nn.Embedding(1, 100) # Dummy
-            self.entity_dim = 100
-
-        self.category_embedding = nn.Embedding(category_size, embed_dim)
-        
-        self.cnn = nn.Conv1d(embed_dim + self.entity_dim, 256, kernel_size=3, padding=1)
-        self.relu = nn.ReLU()
+        self.word_embedding = nn.Embedding(vocab_size, WORD_EMB_DIM, padding_idx=0)
+        if pretrained_emb is not None:
+            self.word_embedding.weight.data.copy_(pretrained_emb)
+            self.word_embedding.weight.requires_grad = True
+        self.cat_embedding = nn.Embedding(cat_size, CAT_EMB_DIM, padding_idx=0)
+        self.self_attn = MultiHeadSelfAttention(WORD_EMB_DIM, NEWS_HEADS)
         self.dropout = nn.Dropout(0.2)
-        self.fc = nn.Linear(256 + embed_dim, 256)
-
-    def forward(self, title, category, entity):
-        w_emb = self.word_embedding(title) 
-        e_emb = self.entity_embedding(entity).unsqueeze(1).expand(-1, title.size(1), -1)
-        x = torch.cat([w_emb, e_emb], dim=-1).permute(0, 2, 1)
-        x = self.dropout(self.relu(self.cnn(x)))
-        title_vec, _ = torch.max(x, dim=-1)
-        cat_vec = self.category_embedding(category)
-        vec = self.fc(torch.cat([title_vec, cat_vec], dim=-1))
-        return vec
+        self.attn_pool = AdditiveAttention(WORD_EMB_DIM, 200)
+        self.final_proj = nn.Linear(WORD_EMB_DIM + CAT_EMB_DIM, TOTAL_NEWS_DIM)
+        
+    def forward(self, title_inputs, cat_inputs):
+        w_emb = self.dropout(self.word_embedding(title_inputs))
+        title_rep = self.self_attn(w_emb)
+        title_vec = self.attn_pool(title_rep)
+        c_emb = self.cat_embedding(cat_inputs)
+        combined = torch.cat([title_vec, c_emb], dim=1)
+        return F.relu(self.final_proj(combined))
 
 class UserEncoder(nn.Module):
     def __init__(self, news_dim):
         super().__init__()
-        self.news_dim = news_dim
-        self.attn_fc = nn.Linear(news_dim, 1)
+        self.self_attn = MultiHeadSelfAttention(news_dim, USER_HEADS)
+        self.dropout = nn.Dropout(0.2)
+        self.attn_pool = AdditiveAttention(news_dim, 200)
         
-    def forward(self, history_vectors):
-        attn_scores = self.attn_fc(torch.tanh(history_vectors))
-        attn_weights = torch.softmax(attn_scores, dim=1)
-        user_vector = torch.sum(history_vectors * attn_weights, dim=1)
-        return user_vector
+    def forward(self, history_vecs):
+        h_rep = self.dropout(self.self_attn(history_vecs))
+        return self.attn_pool(h_rep)
 
-class DualTowerModel(nn.Module):
-    def __init__(self, processor):
+class AdvancedNRMS(nn.Module):
+    def __init__(self, preprocessor):
         super().__init__()
-        self.news_encoder = NewsEncoder(
-            vocab_size=len(processor.word2idx),
-            embed_dim=100,
-            entity_vectors=processor.entity_vectors,
-            category_size=len(processor.category2idx)
-        )
-        self.user_encoder = UserEncoder(news_dim=256)
-
-    def forward_news(self, news_batch):
-        titles = torch.stack([n['title'] for n in news_batch]).to(device)
-        cats = torch.stack([n['category'] for n in news_batch]).to(device)
-        ents = torch.stack([n['entity'] for n in news_batch]).to(device)
-        return self.news_encoder(titles, cats, ents)
-
-    def forward(self, history_list, candidate_list):
-        # Batch encode history
-        batch_history_vecs = [self.forward_news(hist) for hist in history_list]
-        padded_hist = torch.nn.utils.rnn.pad_sequence(batch_history_vecs, batch_first=True)
-        user_vecs = self.user_encoder(padded_hist)
+        # 註冊 Buffer 讓 DDP 可以管理這些常量
+        self.register_buffer('news_title_matrix', torch.LongTensor(preprocessor.news_title_matrix))
+        self.register_buffer('news_cat_matrix', torch.LongTensor(preprocessor.news_cat_matrix))
         
-        scores_list = []
-        for i, candidates in enumerate(candidate_list):
-            c_vecs = self.forward_news(candidates)
-            u_vec = user_vecs[i].unsqueeze(0)
-            scores = torch.sum(u_vec * c_vecs, dim=-1)
-            scores_list.append(scores)
-        return scores_list
-
-# ==========================================
-# 3. 訓練與推論 (Training & Inference)
-# ==========================================
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-def train(args):
-    log("=== Initializing Training Pipeline ===")
-    log(f"Device: {device}")
-    
-    train_news = os.path.join(args.train_data, 'train_news.tsv')
-    train_behaviors = os.path.join(args.train_data, 'train_behaviors.tsv')
-    train_vec = os.path.join(args.train_data, 'train_entity_embedding.vec')
-    
-    processor = NewsProcessor()
-    processor.load_entity_embeddings(train_vec)
-    processor.build_vocab(train_news)
-    processor.process_news(train_news, is_train=True)
-    
-    os.makedirs(args.save_dir, exist_ok=True)
-    processor.save(os.path.join(args.save_dir, 'processor.pkl'))
-    
-    dataset = BehaviorDataset(train_behaviors, processor, is_test=False)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    
-    model = DualTowerModel(processor).to(device)
-    log(f"Model Created. Total Parameters: {get_model_params(model):,}")
-    
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    criterion = nn.BCEWithLogitsLoss()
-    
-    log("=== Start Training Loop ===")
-    model.train()
-    for epoch in range(args.epochs):
-        epoch_start = time.time()
-        total_loss = 0
-        batch_count = 0
+        vocab_size = len(preprocessor.word2int)
+        cat_size = len(preprocessor.cat2int)
         
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
-        for batch in pbar:
-            optimizer.zero_grad()
-            
-            history_list = [item['history'] for item in batch]
-            candidate_list = [item['candidates'] for item in batch]
-            labels_list = [torch.tensor(item['labels']).float().to(device) for item in batch]
-            
-            preds_list = model(history_list, candidate_list)
-            
-            loss = 0
-            count = 0
-            for preds, labels in zip(preds_list, labels_list):
-                loss += criterion(preds, labels)
-                count += 1
-            
-            loss = loss / (count + 1e-9)
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-            batch_count += 1
-            pbar.set_postfix({'loss': total_loss/batch_count})
+        self.news_encoder = NewsEncoder(vocab_size, cat_size, preprocessor.glove_matrix)
+        self.user_encoder = UserEncoder(news_dim=TOTAL_NEWS_DIM)
         
-        avg_loss = total_loss / len(dataloader)
-        epoch_time = time.time() - epoch_start
-        log(f"Epoch {epoch+1} Completed. Avg Loss: {avg_loss:.4f}. Time: {epoch_time:.1f}s")
+    def forward(self, history_ids, candidate_ids):
+        hist_title = self.news_title_matrix[history_ids]
+        hist_cat = self.news_cat_matrix[history_ids]
+        cand_title = self.news_title_matrix[candidate_ids]
+        cand_cat = self.news_cat_matrix[candidate_ids]
         
-        save_path = os.path.join(args.save_dir, f'model_epoch_{epoch+1}.pth')
-        torch.save(model.state_dict(), save_path)
-        log(f"Checkpoint saved: {save_path}")
+        batch_size, hist_len, seq_len = hist_title.shape
+        hist_vecs = self.news_encoder(hist_title.view(-1, seq_len), hist_cat.view(-1)).view(batch_size, hist_len, -1)
+        user_vec = self.user_encoder(hist_vecs)
+        
+        cand_len = cand_title.shape[1]
+        cand_vecs = self.news_encoder(cand_title.view(-1, seq_len), cand_cat.view(-1)).view(batch_size, cand_len, -1)
+        
+        scores = torch.bmm(cand_vecs, user_vec.unsqueeze(2)).squeeze(2)
+        return scores
 
-def inference(args):
-    log("=== Initializing Inference Pipeline ===")
-    log(f"Device: {device}")
-    
-    processor = NewsProcessor()
-    processor.load(os.path.join(args.save_dir, 'processor.pkl'))
-    
-    test_news = os.path.join(args.test_data, 'test_news.tsv')
-    test_behaviors = os.path.join(args.test_data, 'test_behaviors.tsv')
-    
-    # 注意：測試集可能有新新聞
-    processor.process_news(test_news, is_train=False)
-    
-    model = DualTowerModel(processor).to(device)
-    log(f"Loading weights from {args.load_model}...")
-    model.load_state_dict(torch.load(args.load_model, map_location=device))
-    model.eval()
-    
-    dataset = BehaviorDataset(test_behaviors, processor, is_test=True)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
-    
-    results = []
-    unknown_news_encountered = 0
-    
-    log("=== Start Prediction ===")
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Inference"):
-            history_list = [item['history'] for item in batch]
-            imp_ids = [item['imp_id'] for item in batch]
+# --- 4. 資料處理 (Preprocessor & Dataset) ---
+
+class NewsPreprocessor:
+    def __init__(self, news_df, entity_path=None, glove_path=None):
+        self.news_df = news_df
+        self.news2int = {nid: i+1 for i, nid in enumerate(self.news_df['news_id'])}
+        self.cat2int = {'<PAD>': 0, '<UNK>': 1}
+        self.word2int = {'<PAD>': 0, '<UNK>': 1}
+        
+        # 只在主進程打印 Log
+        self.verbose = is_main_process()
+        
+        self.build_category_vocab()
+        self.build_vocab()
+        
+        self.glove_matrix = None
+        if glove_path:
+            self.glove_matrix = self.load_glove(glove_path, embedding_dim=WORD_EMB_DIM)
             
-            candidate_feats_list = []
+        if self.verbose: print("Caching news features...")
+        n_news = len(self.news2int) + 1
+        self.news_title_matrix = np.zeros((n_news, MAX_TITLE_LEN), dtype=np.int64)
+        self.news_cat_matrix = np.zeros((n_news,), dtype=np.int64)
+        self.process_all_news()
+
+    def clean_text(self, text):
+        if pd.isna(text): return ""
+        text = str(text).lower()
+        return re.sub(r'[^\w\s]', '', text)
+
+    def build_vocab(self):
+        if self.verbose: print("Building word vocabulary...")
+        words = []
+        # 使用簡單遍歷，避免多進程 tqdm 衝突
+        for title in self.news_df['title']:
+            words.extend(self.clean_text(title).split())
+        counts = Counter(words)
+        for word, _ in counts.most_common(40000):
+            self.word2int[word] = len(self.word2int)
             
-            for item in batch:
-                c_feats = []
-                for nid in item['candidates']:
-                    if nid in processor.news_features:
-                        c_feats.append(processor.news_features[nid])
-                    else:
-                        # Fallback
-                        unknown_news_encountered += 1
-                        c_feats.append(processor.news_features[list(processor.news_features.keys())[0]])
-                candidate_feats_list.append(c_feats)
+    def build_category_vocab(self):
+        cats = self.news_df['category'].fillna('Unknown').unique()
+        for c in cats:
+            if c not in self.cat2int:
+                self.cat2int[c] = len(self.cat2int)
+
+    def load_glove(self, glove_path, embedding_dim):
+        if self.verbose: print(f"Loading GloVe from {glove_path}...")
+        embeddings_index = {}
+        with open(glove_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                values = line.split()
+                if len(values) != embedding_dim + 1: continue
+                word = values[0]
+                try:
+                    coefs = np.asarray(values[1:], dtype='float32')
+                    embeddings_index[word] = coefs
+                except: continue
+        
+        vocab_size = len(self.word2int)
+        embedding_matrix = np.zeros((vocab_size, embedding_dim))
+        embedding_matrix[1] = np.random.normal(scale=0.6, size=(embedding_dim, ))
+        
+        for word, i in self.word2int.items():
+            vec = embeddings_index.get(word)
+            if vec is not None: embedding_matrix[i] = vec
+        return torch.FloatTensor(embedding_matrix)
+
+    def process_all_news(self):
+        # 簡單處理，不使用 tqdm 以保持 log 乾淨
+        for idx, row in self.news_df.iterrows():
+            nid_idx = self.news2int[row['news_id']]
+            words = self.clean_text(row['title']).split()
+            word_indices = [self.word2int.get(w, 1) for w in words][:MAX_TITLE_LEN]
+            word_indices += [0] * (MAX_TITLE_LEN - len(word_indices))
+            self.news_title_matrix[nid_idx] = word_indices
+            cat = row['category'] if not pd.isna(row['category']) else 'Unknown'
+            self.news_cat_matrix[nid_idx] = self.cat2int.get(cat, 1)
+
+class BehaviorsDataset(Dataset):
+    def __init__(self, behaviors_path, news_preprocessor, mode='train', num_negatives=4):
+        self.preprocessor = news_preprocessor
+        self.mode = mode
+        self.num_negatives = num_negatives
+        self.data = []
+        
+        if is_main_process():
+            print(f"Loading behaviors from {behaviors_path}...")
+        
+        try:
+            df = pd.read_csv(behaviors_path, sep='\t', header=0, names=['idx', 'user_id', 'time', 'history', 'impressions'])
+        except:
+            df = pd.read_csv(behaviors_path, sep='\t', header=None, names=['idx', 'user_id', 'time', 'history', 'impressions'])
             
-            scores_list = model(history_list, candidate_feats_list)
+        news2int = self.preprocessor.news2int
+        
+        # 為了加速讀取，這邊不使用太複雜的邏輯
+        rows = df.values.tolist()
+        for row in rows:
+            # row: [idx, user_id, time, history, impressions]
+            hist_raw = str(row[3])
+            if hist_raw == 'nan': hist_list = []
+            else: hist_list = hist_raw.split()
             
-            for imp_id, scores in zip(imp_ids, scores_list):
-                probs = torch.sigmoid(scores).cpu().numpy().tolist()
-                # Ensure 15 probabilities
-                if len(probs) < 15:
-                    probs += [0.0] * (15 - len(probs))
-                elif len(probs) > 15:
-                    probs = probs[:15]
+            hist_indices = [news2int.get(nid, 0) for nid in hist_list][-MAX_HISTORY_LEN:]
+            hist_indices += [0] * (MAX_HISTORY_LEN - len(hist_indices))
+            
+            impressions_raw = str(row[4]).split()
+            
+            if mode == 'train':
+                positives, negatives = [], []
+                for imp in impressions_raw:
+                    parts = imp.split('-')
+                    if len(parts) != 2: continue
+                    nid, label = parts
+                    idx = news2int.get(nid, 0)
+                    if int(label) == 1: positives.append(idx)
+                    else: negatives.append(idx)
                 
-                results.append([imp_id] + probs)
-    
-    log(f"Inference Done. Unknown News Encounters: {unknown_news_encountered}")
-    
-    cols = ['id'] + [f'p{i+1}' for i in range(15)]
-    sub_df = pd.DataFrame(results, columns=cols)
-    out_file = unique_filename('submission.csv')
-    sub_df.to_csv(out_file, index=False)
-    log(f"Submission saved to {out_file} (Rows: {len(sub_df)})")
+                for pos_idx in positives:
+                    self.data.append({'history': hist_indices, 'candidate': pos_idx, 'label': 1})
+                    if len(negatives) > 0:
+                        neg_samples = random.choices(negatives, k=self.num_negatives)
+                        for neg_idx in neg_samples:
+                            self.data.append({'history': hist_indices, 'candidate': neg_idx, 'label': 0})
+            else:
+                cand_indices = [news2int.get(imp.split('-')[0], 0) for imp in impressions_raw]
+                if len(cand_indices) != 15: continue
+                self.data.append({'id': row[0], 'history': hist_indices, 'candidate': cand_indices})
 
-def unique_filename(base_name):
-    """生成唯一的檔案名稱以避免覆蓋"""
-    counter = 1
-    new_name = base_name
-    while os.path.exists(new_name):
-        new_name = f"{os.path.splitext(base_name)[0]}_{counter}{os.path.splitext(base_name)[1]}"
-        counter += 1
-    return new_name
+    def __len__(self): return len(self.data)
+    
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        hist = torch.LongTensor(item['history'])
+        if self.mode == 'train':
+            cand = torch.LongTensor([item['candidate']])
+            label = torch.FloatTensor([item['label']])
+            return hist, cand, label
+        else:
+            cand = torch.LongTensor(item['candidate'])
+            return item['id'], hist, cand
 
-# ==========================================
-# 4. 主程式入口 (Main Entry)
-# ==========================================
+# --- 5. 訓練與預測函數 ---
+
+def train_one_epoch(model, dataloader, optimizer, criterion, device, scaler, epoch):
+    model.train()
+    
+    # DDP 需要在每個 epoch 設定 sampler
+    if dataloader.sampler is not None:
+        dataloader.sampler.set_epoch(epoch)
+        
+    total_loss = 0
+    
+    # 只在 rank 0 顯示進度條
+    if is_main_process():
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
+    else:
+        pbar = dataloader
+
+    for hist, cand, label in pbar:
+        hist, cand, label = hist.to(device, non_blocking=True), cand.to(device, non_blocking=True), label.to(device, non_blocking=True)
+        
+        optimizer.zero_grad()
+        
+        # [優化] AMP 混合精度運算
+        with torch.amp.autocast('cuda'):
+            scores = model(hist, cand)
+            loss = criterion(scores, label)
+        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        
+        total_loss += loss.item()
+        
+        if is_main_process():
+            pbar.set_postfix({'loss': loss.item()})
+            
+    return total_loss / len(dataloader)
+
+def generate_submission(model, test_loader, device, output_path='submission.csv'):
+    model.eval()
+    results = []
+    print(f"Start inference on Rank 0...")
+    with torch.no_grad():
+        for imp_ids, hist, cand in tqdm(test_loader, desc="Predicting"):
+            hist, cand = hist.to(device), cand.to(device)
+            # 使用 model 進行推論 (注意 DDP 模式下可能是 model.module)
+            scores = model(hist, cand)
+            probs = torch.sigmoid(scores).cpu().numpy()
+            imp_ids = imp_ids.numpy()
+            
+            for i in range(len(imp_ids)):
+                results.append([imp_ids[i]] + probs[i].tolist())
+
+    cols = ['id'] + [f'p{i}' for i in range(1, 16)]
+    submission_df = pd.DataFrame(results, columns=cols)
+    submission_df.sort_values(by='id').to_csv(output_path, index=False)
+    print(f"Saved to {output_path}")
+
+# --- 6. 主程式 ---
+
+def main():
+    # 1. 初始化 DDP
+    local_rank, rank, world_size = setup_ddp()
+    device = torch.device(f"cuda:{local_rank}")
+    
+    # 2. 準備資料 (Preprocess)
+    # 注意：這裡為了程式碼簡單，所有 GPU 都會讀取資料 (32GB VRAM 足夠)
+    # 正式大規模系統可能會讓 Rank 0 處理完存成 cache，其他人讀 cache
+    if rank == 0: print("Merging Train and Test News...")
+    
+    cols = ['news_id', 'category', 'subcategory', 'title', 'abstract', 'url', 'title_entities', 'abstract_entities']
+    df_train = pd.read_csv(PATH_TRAIN_NEWS, sep='\t', header=None, names=cols)
+    df_test = pd.read_csv(PATH_TEST_NEWS, sep='\t', header=None, names=cols)
+    df_all = pd.concat([df_train, df_test]).drop_duplicates(subset='news_id').reset_index(drop=True)
+    
+    preprocessor = NewsPreprocessor(df_all, glove_path=PATH_GLOVE)
+    
+    # 3. Dataset & DDP Sampler
+    train_ds = BehaviorsDataset(PATH_TRAIN_BEHAVIORS, preprocessor, mode='train', num_negatives=NUM_NEGATIVES)
+    
+    # 使用 DistributedSampler 切分資料
+    train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
+    
+    train_loader = DataLoader(
+        train_ds, 
+        batch_size=BATCH_SIZE, 
+        shuffle=False, # Shuffle 由 Sampler 負責
+        num_workers=4, # 每個 GPU 開 4 個 subprocess，8 卡共 32
+        pin_memory=True, 
+        sampler=train_sampler,
+        persistent_workers=True
+    )
+    
+    # 4. Model Setup
+    model = AdvancedNRMS(preprocessor).to(device)
+    
+    # 將 BatchNorm 轉為 SyncBatchNorm (如果有用的話，這裡主要是保險)
+    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    
+    # DDP 包裝
+    if world_size > 1:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    criterion = nn.BCEWithLogitsLoss()
+    scaler = torch.amp.GradScaler('cuda') # 初始化 AMP Scaler
+    
+    # 5. Training Loop
+    for epoch in range(NUM_EPOCHS):
+        if rank == 0:
+            print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
+            
+        loss = train_one_epoch(model, train_loader, optimizer, criterion, device, scaler, epoch)
+        
+        if rank == 0:
+            print(f"Epoch Loss (Rank 0 approx): {loss:.4f}")
+            # 存檔時，記得存 model.module
+            checkpoint = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+            torch.save(checkpoint, f"model_epoch_{epoch+1}.pth")
+            
+        # 等待所有 GPU 完成這一輪，再進入下一輪
+        dist.barrier()
+
+    # 6. Inference (Only Rank 0)
+    if rank == 0:
+        print("Training finished. Starting inference...")
+        # 測試集不需要 DDP，單卡跑即可 (或你可以也寫成 DDP，但處理 ID 順序比較麻煩)
+        test_ds = BehaviorsDataset(PATH_TEST_BEHAVIORS, preprocessor, mode='test')
+        test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+        
+        eval_model = model.module if hasattr(model, 'module') else model
+        generate_submission(eval_model, test_loader, device, output_path='submission_8gpu.csv')
+    
+    cleanup_ddp()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'inference'])
-    parser.add_argument('--train_data', type=str, default='./dataset/train')
-    parser.add_argument('--test_data', type=str, default='./dataset/test')
-    parser.add_argument('--save_dir', type=str, default='./save_models')
-    parser.add_argument('--load_model', type=str, default=None)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--epochs', type=int, default=3)
-    parser.add_argument('--lr', type=float, default=0.001)
-    
-    args = parser.parse_args()
-    
-    set_seed()
-    
-    if args.mode == 'train':
-        train(args)
-    elif args.mode == 'inference':
-        if not args.load_model:
-            print("Error: --load_model is required for inference.")
-        else:
-            inference(args)
+    main()
