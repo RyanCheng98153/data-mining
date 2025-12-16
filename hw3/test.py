@@ -15,8 +15,8 @@ from tqdm import tqdm
 # --- 1. 設定參數 ---
 MAX_TITLE_LEN = 30
 MAX_HISTORY_LEN = 50
-BATCH_SIZE = 64          # Self-Attention 比較吃顯存，若 OOM 可改為 32
-NUM_EPOCHS = 4          # 因為有負採樣，訓練變快，可以多跑幾輪
+BATCH_SIZE = 256          # Self-Attention 比較吃顯存，若 OOM 可改為 32
+NUM_EPOCHS = 3          # 因為有負採樣，訓練變快，可以多跑幾輪
 LEARNING_RATE = 0.0005   # Transformer 類模型建議 LR 小一點
 NUM_NEGATIVES = 4        # 負採樣比例 1:4
 
