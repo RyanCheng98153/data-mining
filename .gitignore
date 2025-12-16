@@ -11,6 +11,8 @@ __pycache__/
 
 dataset/
 dataset/*
+MINDlarge*
+MINDsmall*
 
 # Distribution / packaging
 .Python
