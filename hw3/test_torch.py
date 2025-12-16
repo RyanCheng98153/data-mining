@@ -7,7 +7,6 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import autocast, GradScaler
 import torch.distributed as dist
 from collections import Counter
 import re
@@ -24,7 +23,7 @@ MAX_HISTORY_LEN = 50
 # 總 Batch Size = 512 * 8 = 4096
 BATCH_SIZE = 512  
 
-NUM_EPOCHS = 30
+NUM_EPOCHS = 20
 # [優化] 因為總 Batch Size 變大，Learning Rate 建議稍微調大
 LEARNING_RATE = 0.001  
 NUM_NEGATIVES = 4
@@ -331,7 +330,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, scaler, epo
         optimizer.zero_grad()
         
         # [優化] AMP 混合精度運算
-        with autocast():
+        with torch.amp.autocast('cuda'):
             scores = model(hist, cand)
             loss = criterion(scores, label)
         
@@ -413,7 +412,7 @@ def main():
         
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.BCEWithLogitsLoss()
-    scaler = GradScaler() # 初始化 AMP Scaler
+    scaler = torch.amp.GradScaler('cuda') # 初始化 AMP Scaler
     
     # 5. Training Loop
     for epoch in range(NUM_EPOCHS):
