@@ -15,7 +15,7 @@ import random
 import sys
 from tqdm import tqdm
 
-# --- 1. 設定參數 (針對 8x V100 極致優化版) ---
+# --- 1. 設定參數 (針對 GPU 極致優化版) ---
 
 # [優化] 增加標題長度，避免資訊被截斷
 MAX_TITLE_LEN = 40  
@@ -38,12 +38,16 @@ LEARNING_RATE = 0.001
 NUM_NEGATIVES = 9  
 
 # Embedding 設定
+# [Correction] Adjust dimensions to be divisible by heads
 WORD_EMB_DIM = 100
 CAT_EMB_DIM = 50
 NEWS_HEADS = 20
 
 # [優化] 增加新聞向量維度 (原本 250 -> 400)
-NEWS_DIM = 400          
+# CHANGE THIS VALUE FROM 400 TO 410
+NEWS_DIM = 410          
+# Math: 410 + 50 = 460. 
+# 460 is divisible by USER_HEADS (20). Result is 23 per head.
 TOTAL_NEWS_DIM = NEWS_DIM + CAT_EMB_DIM
 USER_HEADS = 20
 
