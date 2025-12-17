@@ -1,0 +1,2 @@
+# keep the .csv files in the dataset folder
+!dataset/*.csv
